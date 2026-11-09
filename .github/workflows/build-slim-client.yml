@@ -8,6 +8,9 @@ on:
   workflow_dispatch:
 
 env:
+  # Windows runner 的 Python 默认用 cp1252 输出，中文会直接抛 UnicodeEncodeError
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
   # 上游源码固定在补丁对应的提交，避免上游改动导致补丁失效
   RUSTDESK_REF: 05b9f2d8919b5cdfaa0bb3280601a02881556a42
   RUST_VERSION: '1.75'
@@ -110,10 +113,10 @@ jobs:
           key = items.get("KEY", "")
           for name, val in (("ID", id_srv), ("API", api), ("KEY", key)):
               if not val:
-                  sys.exit("缺少配置项 " + name)
+                  sys.exit("missing config item: " + name)
 
           if len(key.rstrip("=")) != 43:
-              print("::warning::KEY 长度为 %d 字符，RustDesk 需要 44 字符 Base64" % len(key))
+              print("::warning::KEY length is %d chars; RustDesk expects 44-char Base64" % len(key))
 
           host = id_srv.split(":")[0]
 
@@ -126,8 +129,8 @@ jobs:
                   f.write(s)
               left = [a for a, _ in pairs if a in s]
               if left:
-                  sys.exit(path + " 仍有未替换占位符: " + repr(left))
-              print("注入完成: " + path)
+                  sys.exit(path + " still has placeholders: " + repr(left))
+              print("injected: " + path)
 
           sub("src/custom_build.rs", [
               ("__RD_ID_SERVER__", id_srv),
@@ -162,8 +165,8 @@ jobs:
               d["overrides"] = [x for x in d["overrides"] if x["name"] not in ("ffnvcodec", "amd-amf")]
           with open("vcpkg.json", "w", encoding="utf-8") as f:
               json.dump(d, f, indent=2)
-          print("去掉:", sorted(set(before) & drop))
-          print("保留:", sorted({x["name"] for x in d["dependencies"]}))
+          print("dropped:", sorted(set(before) & drop))
+          print("kept:", sorted({x["name"] for x in d["dependencies"]}))
           PY
 
       - name: Setup Flutter
