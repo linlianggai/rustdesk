@@ -194,22 +194,42 @@ jobs:
         run: |
           flutter doctor -v
           flutter precache --windows
+
+          # 不硬编码 toolcache 路径，直接从 flutter 可执行文件反推 SDK 根目录
+          $flutterExe = (Get-Command flutter).Source
+          $root = Split-Path -Parent (Split-Path -Parent $flutterExe)
+          Write-Host "FLUTTER_ROOT=$root"
+          $base = Join-Path $root "bin/cache/artifacts/engine"
+          if (-not (Test-Path $base)) { throw "engine base dir not found: $base" }
+          Get-ChildItem $base | Select-Object -ExpandProperty Name
+
+          $dst = Join-Path $base "windows-x64-release"
+          if (-not (Test-Path $dst)) {
+            $alt = Join-Path $base "windows-x64"
+            if (Test-Path $alt) { $dst = $alt } else { throw "no windows engine dir under $base" }
+          }
+          Write-Host "ENGINE_DST=$dst"
+
           $zip = "windows-x64-release.zip"
           $url = "https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip"
           for ($i = 1; $i -le 4; $i++) {
             try {
               Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
               if ((Get-Item $zip).Length -gt 10MB) { break }
-            } catch { Write-Host "下载失败第 $i 次: $_" }
-            if ($i -eq 4) { throw "引擎下载失败" }
+            } catch { Write-Host "download failed (try $i): $_" }
+            if ($i -eq 4) { throw "engine download failed" }
             Start-Sleep -Seconds 5
           }
           if (Test-Path engine_x) { Remove-Item engine_x -Recurse -Force }
           Expand-Archive -Path $zip -DestinationPath engine_x -Force
-          $dst = "C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release"
-          if (-not (Test-Path $dst)) { throw "引擎目录不存在: $dst" }
-          Move-Item -Force engine_x/* $dst
-          Get-ChildItem $dst | Select-Object -First 6 -ExpandProperty Name
+
+          # zip 里可能多套一层 windows-x64-release 目录
+          $items = @(Get-ChildItem engine_x)
+          $srcDir = "engine_x"
+          if ($items.Count -eq 1 -and $items[0].PSIsContainer) { $srcDir = $items[0].FullName }
+          Write-Host "ENGINE_SRC=$srcDir"
+          Copy-Item -Path (Join-Path $srcDir "*") -Destination $dst -Recurse -Force
+          Get-ChildItem $dst | Select-Object -First 8 -ExpandProperty Name
 
       - name: Patch Flutter (dropdown filter)
         shell: bash
