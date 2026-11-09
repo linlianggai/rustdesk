@@ -78,14 +78,15 @@ jobs:
         run: |
           set -euo pipefail
           # Windows runner 上 checkout 可能把补丁转成 CRLF，先统一为 LF
-          for p in ../patches/*.patch; do
+          ls -la patches
+          for p in patches/*.patch; do
             sed -i 's/\r$//' "$p"
           done
           cd rd
           git apply -p1 ../patches/rustdesk-custom.patch
           git apply -p1 --directory=libs/hbb_common ../patches/hbb-common-server.patch
 
-          python3 - <<'PY'
+          python - <<'PY'
           import os, sys
 
           cfg = os.environ.get("RD_CONFIG", "").strip()
@@ -150,7 +151,7 @@ jobs:
         run: |
           set -euo pipefail
           cd rd
-          python3 - <<'PY'
+          python - <<'PY'
           import json
           with open("vcpkg.json", encoding="utf-8") as f:
               d = json.load(f)
@@ -257,7 +258,7 @@ jobs:
         run: |
           set -euo pipefail
           cd rd
-          python3 build.py --portable --flutter --skip-portable-pack
+          python build.py --portable --flutter --skip-portable-pack
           ls -la "flutter/build/windows/x64/runner/Release" | head -20
 
       - name: Package
