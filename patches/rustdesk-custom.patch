@@ -1,0 +1,219 @@
+diff --git a/flutter/lib/desktop/pages/desktop_home_page.dart b/flutter/lib/desktop/pages/desktop_home_page.dart
+index 12951ca..2fec0b5 100644
+--- a/flutter/lib/desktop/pages/desktop_home_page.dart
++++ b/flutter/lib/desktop/pages/desktop_home_page.dart
+@@ -220,7 +220,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
+                                   ?.color
+                                   ?.withOpacity(0.5)),
+                         ).marginOnly(top: 5),
+-                        buildPopupMenu(context)
++                        if (!bind.isDisableSettings()) buildPopupMenu(context)
+                       ],
+                     ),
+                   ),
+diff --git a/flutter/lib/desktop/pages/desktop_tab_page.dart b/flutter/lib/desktop/pages/desktop_tab_page.dart
+index 6440e55..15a837f 100644
+--- a/flutter/lib/desktop/pages/desktop_tab_page.dart
++++ b/flutter/lib/desktop/pages/desktop_tab_page.dart
+@@ -20,6 +20,10 @@ class DesktopTabPage extends StatefulWidget {
+ 
+   static void onAddSetting(
+       {SettingsTabKey initialPage = SettingsTabKey.general}) {
++    // 定制版：设置功能被硬禁用时，任何入口都不再打开设置页
++    if (bind.isDisableSettings()) {
++      return;
++    }
+     try {
+       DesktopTabController tabController = Get.find<DesktopTabController>();
+       tabController.add(TabInfo(
+diff --git a/src/common.rs b/src/common.rs
+index 4bc5bc2..7a0965c 100644
+--- a/src/common.rs
++++ b/src/common.rs
+@@ -2507,6 +2507,8 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
+ }
+ 
+ pub fn load_custom_client() {
++    // 定制版：先注入编译期内置配置（服务器地址、仅被控、禁用设置等）
++    crate::custom_build::apply();
+     #[cfg(debug_assertions)]
+     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
+         read_custom_client(data.trim());
+diff --git a/src/custom_build.rs b/src/custom_build.rs
+new file mode 100644
+index 0000000..3eaee67
+--- /dev/null
++++ b/src/custom_build.rs
+@@ -0,0 +1,146 @@
++//! 内置（编译期硬编码）客户端配置。
++//!
++//! 本文件用于生成"精简版"RustDesk 客户端：
++//!   1. 把 ID/中继/API 服务器与公钥写死进程序，用户无法修改；
++//!   2. 隐藏并禁用全部设置项；
++//!   3. 只保留"被控"能力（删除"控制远程桌面"功能）。
++//!
++//! 修改下面的常量后重新编译即可，不需要其它代码改动。
++
++use hbb_common::config;
++
++/// 总开关：false 时恢复成官方默认行为（调试用）。
++pub const ENABLED: bool = true;
++
++// ==================== 服务器参数 ====================
++
++// 下面四项由打包脚本在编译前替换（见 .github/workflows/build-windows.yml）。
++// 源码里不写真实值，避免公开仓库泄露服务器地址与公钥。
++
++/// ID（rendezvous）服务器，格式 host:port
++pub const RENDEZVOUS_SERVER: &str = "__RD_ID_SERVER__";
++/// 中继服务器，格式 host:port
++pub const RELAY_SERVER: &str = "__RD_RELAY_SERVER__";
++/// API 服务器，格式带协议头
++pub const API_SERVER: &str = "__RD_API_SERVER__";
++/// hbbs 服务端公钥（id_ed25519.pub 的内容）
++pub const KEY: &str = "__RD_KEY__";
++
++// ==================== 功能开关 ====================
++
++/// true：仅被控模式。隐藏"控制远程桌面"入口，并在 Rust 层拒绝一切主动外连。
++pub const INCOMING_ONLY: bool = true;
++/// true：隐藏设置入口并禁止修改任何设置（含命令行 --option 覆盖）。
++pub const DISABLE_SETTINGS: bool = true;
++/// true：隐藏"账户/登录"相关入口。
++pub const DISABLE_ACCOUNT: bool = true;
++/// true：关闭自动更新（避免被升级回官方版本而丢失定制）。
++pub const DISABLE_AUTO_UPDATE: bool = true;
++/// true：隐藏首页帮助卡片，界面更精简。
++pub const HIDE_HELP_CARDS: bool = true;
++
++/// 可选：自定义应用名（影响窗口标题、托盘提示等）。
++/// 留空表示沿用 RustDesk，改动后建议全新安装，避免与旧配置目录冲突。
++pub const APP_NAME: &str = "";
++
++/// 把上述参数写入 RustDesk 的运行时配置表。
++///
++/// - OVERWRITE_SETTINGS 优先级最高，且会让 `Config::set_option` 拒绝写入，
++///   因此用户/配置文件都无法覆盖服务器地址。
++/// - HARD_SETTINGS 驱动 is_incoming_only() / is_disable_settings() 等硬开关。
++/// - BUILTIN_SETTINGS 驱动 Flutter 端的界面隐藏逻辑。
++pub fn apply() {
++    if !ENABLED {
++        return;
++    }
++
++    check_key(KEY);
++    check_placeholder(RENDEZVOUS_SERVER);
++    check_placeholder(RELAY_SERVER);
++    check_placeholder(API_SERVER);
++    check_placeholder(KEY);
++
++    {
++        let mut settings = config::OVERWRITE_SETTINGS.write().unwrap();
++        settings.insert(
++            "custom-rendezvous-server".to_owned(),
++            RENDEZVOUS_SERVER.to_owned(),
++        );
++        settings.insert("relay-server".to_owned(), RELAY_SERVER.to_owned());
++        settings.insert("api-server".to_owned(), API_SERVER.to_owned());
++        settings.insert("key".to_owned(), KEY.to_owned());
++        if DISABLE_AUTO_UPDATE {
++            settings.insert("allow-auto-update".to_owned(), "N".to_owned());
++        }
++    }
++
++    {
++        let mut hard = config::HARD_SETTINGS.write().unwrap();
++        if INCOMING_ONLY {
++            // incoming-only：UI 只保留本机 ID/密码，Rust 层拦截所有主动连接
++            hard.insert("conn-type".to_owned(), "incoming".to_owned());
++        }
++        if DISABLE_SETTINGS {
++            hard.insert("disable-settings".to_owned(), "Y".to_owned());
++        }
++        if DISABLE_ACCOUNT {
++            hard.insert("disable-account".to_owned(), "Y".to_owned());
++        }
++    }
++
++    if DISABLE_SETTINGS {
++        let mut builtin = config::BUILTIN_SETTINGS.write().unwrap();
++        for k in [
++            "hide-general-settings",
++            "hide-security-settings",
++            "hide-network-settings",
++            "hide-server-settings",
++            "hide-proxy-settings",
++            "hide-websocket-settings",
++            "hide-remote-printer-settings",
++            "hide-stop-service",
++        ] {
++            builtin.insert(k.to_owned(), "Y".to_owned());
++        }
++        // 锁死 ID，防止通过其它路径改动
++        builtin.insert("disable-change-id".to_owned(), "Y".to_owned());
++        builtin.insert("disable-change-permanent-password".to_owned(), "Y".to_owned());
++    }
++
++    if HIDE_HELP_CARDS {
++        config::BUILTIN_SETTINGS
++            .write()
++            .unwrap()
++            .insert("hide-help-cards".to_owned(), "Y".to_owned());
++    }
++
++    if !APP_NAME.is_empty() {
++        *config::APP_NAME.write().unwrap() = APP_NAME.to_owned();
++    }
++}
++
++/// 公钥必须是 32 字节 ed25519 公钥的 Base64（44 字符，末尾带 '='）。
++/// 长度不对时连接会直接失败，这里提前打日志，便于排查。
++fn check_key(key: &str) {
++    let body = key.trim().trim_end_matches('=');
++    if body.len() != 43 && !key.contains("__RD_") {
++        log::error!(
++            "[custom_build] KEY 格式可疑: '{}' ({} 字符)。应为 44 字符 Base64，\
++             内容取自服务端 /root/rustdesk/id_ed25519.pub，请核对后重新编译。",
++            key,
++            key.len()
++        );
++    }
++}
++
++/// 构建脚本没替换占位符时，客户端会连不上任何服务器。
++/// 这里在启动日志里明确报出来，避免"能启动但连不上"的困惑。
++fn check_placeholder(v: &str) {
++    if v.contains("__RD_") {
++        log::error!(
++            "[custom_build] 配置未注入: '{}'。请在 CI 中配置 RD_ID_SERVER / RD_RELAY_SERVER / \
++             RD_API_SERVER / RD_KEY 四个 Secret 后重新构建。",
++            v
++        );
++    }
++}
+diff --git a/src/flutter_ffi.rs b/src/flutter_ffi.rs
+index 0d6ca0a..04558e6 100644
+--- a/src/flutter_ffi.rs
++++ b/src/flutter_ffi.rs
+@@ -47,6 +47,8 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
+     {
+         *config::APP_DIR.write().unwrap() = app_dir.to_owned();
+     }
++    // 定制版：内置配置必须先于 UI 初始化，保证首帧即使用定制参数
++    crate::custom_build::apply();
+     // core_main's load_custom_client does not work for flutter since it is only applied to its load_library in main.c
+     if custom_client_config.is_empty() {
+         crate::load_custom_client();
+diff --git a/src/lib.rs b/src/lib.rs
+index f6e48a1..25e42f0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -49,6 +49,8 @@ mod clipboard;
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+ pub mod core_main;
+ mod custom_server;
++/// 定制版内置配置（服务器地址/功能开关），见文件内说明
++pub mod custom_build;
+ mod lang;
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+ mod port_forward;
