@@ -1,0 +1,15 @@
+diff --git a/src/config.rs b/src/config.rs
+index 9ee5cac..5d5a40d 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -113,8 +113,8 @@ const CHARS: &[char] = &[
+     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+ ];
+ 
+-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
+-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
++pub const RENDEZVOUS_SERVERS: &[&str] = &["__RD_ID_SERVER_HOST__"];
++pub const RS_PUB_KEY: &str = "__RD_KEY__";
+ 
+ pub const RENDEZVOUS_PORT: i32 = 21116;
+ pub const RELAY_PORT: i32 = 21117;
