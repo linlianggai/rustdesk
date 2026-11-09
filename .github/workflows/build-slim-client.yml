@@ -1,0 +1,279 @@
+name: Build RustDesk Slim Client (Windows x64)
+
+# 用法：Actions -> 左侧 "Build RustDesk Slim Client (Windows x64)" -> Run workflow
+# 前置：仓库 Settings -> Secrets and variables -> Actions -> New repository secret
+#      名称 RD_CONFIG，值形如：
+#      ID=host:21116;RELAY=host:21117;API=http://host:21114;KEY=<服务端 id_ed25519.pub 整行>
+on:
+  workflow_dispatch:
+
+env:
+  # 上游源码固定在补丁对应的提交，避免上游改动导致补丁失效
+  RUSTDESK_REF: 05b9f2d8919b5cdfaa0bb3280601a02881556a42
+  RUST_VERSION: '1.75'
+  FLUTTER_VERSION: '3.24.5'
+  VCPKG_COMMIT_ID: '9e593bb18ea69cc5095e012465dcd675a822ed0d'
+  VCPKG_DEFAULT_TRIPLET: x64-windows-static
+  VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 只需要补丁，避免把整个 fork 源码拉一遍
+          sparse-checkout: patches
+
+      # 先花 3 秒确认参数齐了，避免白跑一小时
+      - name: Preflight - validate server config
+        shell: bash
+        env:
+          RD_CONFIG: ${{ secrets.RD_CONFIG }}
+          RD_ID_SERVER: ${{ secrets.RD_ID_SERVER }}
+          RD_RELAY_SERVER: ${{ secrets.RD_RELAY_SERVER }}
+          RD_API_SERVER: ${{ secrets.RD_API_SERVER }}
+          RD_KEY: ${{ secrets.RD_KEY }}
+        run: |
+          if [ -n "$RD_CONFIG" ]; then
+            echo "使用 RD_CONFIG:"
+            echo "$RD_CONFIG" | tr ';' '\n' | sed 's/=.*/=***/; s/^/  /'
+            exit 0
+          fi
+          if [ -n "$RD_ID_SERVER" ] && [ -n "$RD_API_SERVER" ] && [ -n "$RD_KEY" ]; then
+            echo "使用 4 条独立配置"
+            exit 0
+          fi
+          echo "::error::缺少构建参数。请到 Settings -> Secrets and variables -> Actions 新增 Secret："
+          echo "::error::名称 RD_CONFIG，值：ID=host:21116;RELAY=host:21117;API=http://host:21114;KEY=<公钥>"
+          exit 1
+
+      - name: Fetch RustDesk source (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf rd && mkdir rd && cd rd
+          git init -q .
+          # 关键：不做换行转换，否则补丁会因 CRLF 而无法应用
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin https://github.com/rustdesk/rustdesk.git
+          git fetch -q --depth 1 origin "$RUSTDESK_REF"
+          git checkout -q FETCH_HEAD
+          git submodule update -q --init --depth 1 -- libs/hbb_common
+          git log --oneline -1
+          find . -name "*.rs" -path "./src/*" | head -3
+
+      - name: Apply patches and inject server config
+        shell: bash
+        env:
+          RD_CONFIG: ${{ secrets.RD_CONFIG }}
+          RD_ID_SERVER: ${{ secrets.RD_ID_SERVER }}
+          RD_RELAY_SERVER: ${{ secrets.RD_RELAY_SERVER }}
+          RD_API_SERVER: ${{ secrets.RD_API_SERVER }}
+          RD_KEY: ${{ secrets.RD_KEY }}
+        run: |
+          set -euo pipefail
+          # Windows runner 上 checkout 可能把补丁转成 CRLF，先统一为 LF
+          for p in ../patches/*.patch; do
+            sed -i 's/\r$//' "$p"
+          done
+          cd rd
+          git apply -p1 ../patches/rustdesk-custom.patch
+          git apply -p1 --directory=libs/hbb_common ../patches/hbb-common-server.patch
+
+          python3 - <<'PY'
+          import os, sys
+
+          cfg = os.environ.get("RD_CONFIG", "").strip()
+          items = {}
+          if cfg:
+              for part in cfg.replace("\n", ";").split(";"):
+                  if "=" in part:
+                      k, v = part.split("=", 1)
+                      items[k.strip().upper()] = v.strip()
+          else:
+              items = {
+                  "ID": os.environ.get("RD_ID_SERVER", "").strip(),
+                  "RELAY": os.environ.get("RD_RELAY_SERVER", "").strip(),
+                  "API": os.environ.get("RD_API_SERVER", "").strip(),
+                  "KEY": os.environ.get("RD_KEY", "").strip(),
+              }
+
+          id_srv = items.get("ID", "")
+          relay = items.get("RELAY", "") or id_srv
+          api = items.get("API", "")
+          key = items.get("KEY", "")
+          for name, val in (("ID", id_srv), ("API", api), ("KEY", key)):
+              if not val:
+                  sys.exit("缺少配置项 " + name)
+
+          if len(key.rstrip("=")) != 43:
+              print("::warning::KEY 长度为 %d 字符，RustDesk 需要 44 字符 Base64" % len(key))
+
+          host = id_srv.split(":")[0]
+
+          def sub(path, pairs):
+              with open(path, encoding="utf-8") as f:
+                  s = f.read()
+              for a, b in pairs:
+                  s = s.replace(a, b)
+              with open(path, "w", encoding="utf-8", newline="\n") as f:
+                  f.write(s)
+              left = [a for a, _ in pairs if a in s]
+              if left:
+                  sys.exit(path + " 仍有未替换占位符: " + repr(left))
+              print("注入完成: " + path)
+
+          sub("src/custom_build.rs", [
+              ("__RD_ID_SERVER__", id_srv),
+              ("__RD_RELAY_SERVER__", relay),
+              ("__RD_API_SERVER__", api),
+              ("__RD_KEY__", key),
+          ])
+          sub("libs/hbb_common/src/config.rs", [
+              ("__RD_ID_SERVER_HOST__", host),
+              ("__RD_KEY__", key),
+          ])
+          PY
+
+          echo "--- 注入结果 ---"
+          grep -nE 'RENDEZVOUS_SERVER:|RELAY_SERVER:|API_SERVER:' src/custom_build.rs
+          grep -n 'RENDEZVOUS_SERVERS' libs/hbb_common/src/config.rs | head -1
+
+      # 只做被控端、不启用硬件编解码，ffmpeg / mfx-dispatch 用不到，去掉可省 30 分钟以上
+      - name: Trim vcpkg deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd rd
+          python3 - <<'PY'
+          import json
+          with open("vcpkg.json", encoding="utf-8") as f:
+              d = json.load(f)
+          drop = {"ffmpeg", "mfx-dispatch"}
+          before = [x["name"] for x in d["dependencies"]]
+          d["dependencies"] = [x for x in d["dependencies"] if x["name"] not in drop]
+          if d.get("overrides"):
+              d["overrides"] = [x for x in d["overrides"] if x["name"] not in ("ffnvcodec", "amd-amf")]
+          with open("vcpkg.json", "w", encoding="utf-8") as f:
+              json.dump(d, f, indent=2)
+          print("去掉:", sorted(set(before) & drop))
+          print("保留:", sorted({x["name"] for x in d["dependencies"]}))
+          PY
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          architecture: x64
+          cache: true
+
+      - name: Setup LLVM (bindgen)
+        shell: pwsh
+        run: |
+          $dir = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$dir\libclang.dll")) {
+            Write-Host "未检测到 LLVM，安装中..."
+            choco install llvm --no-progress -y | Out-Null
+          }
+          if (-not (Test-Path "$dir\libclang.dll")) { throw "libclang.dll 未找到" }
+          "LIBCLANG_PATH=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-Item "$dir\libclang.dll" | Select-Object Length
+
+      - name: Replace with RustDesk custom Flutter engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          $zip = "windows-x64-release.zip"
+          $url = "https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip"
+          for ($i = 1; $i -le 4; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+              if ((Get-Item $zip).Length -gt 10MB) { break }
+            } catch { Write-Host "下载失败第 $i 次: $_" }
+            if ($i -eq 4) { throw "引擎下载失败" }
+            Start-Sleep -Seconds 5
+          }
+          if (Test-Path engine_x) { Remove-Item engine_x -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath engine_x -Force
+          $dst = "C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release"
+          if (-not (Test-Path $dst)) { throw "引擎目录不存在: $dst" }
+          Move-Item -Force engine_x/* $dst
+          Get-ChildItem $dst | Select-Object -First 6 -ExpandProperty Name
+
+      - name: Patch Flutter (dropdown filter)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLUTTER_ROOT="$(dirname "$(dirname "$(command -v flutter)")")"
+          cp rd/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$FLUTTER_ROOT/"
+          cd "$FLUTTER_ROOT"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff || echo "补丁已存在，跳过"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-windows-x64-slim
+          workspaces: rd -> target
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_DEFAULT_TRIPLET }}
+        run: |
+          set -euo pipefail
+          cd rd
+          if ! "$VCPKG_ROOT/vcpkg.exe" install \
+                --triplet "$VCPKG_DEFAULT_TRIPLET" \
+                --x-install-root="$VCPKG_ROOT/installed"; then
+            echo "::group::vcpkg 失败日志"
+            find "$VCPKG_ROOT/buildtrees" -name "*.log" -newermt "-90 minutes" 2>/dev/null | head -20 | while read -r f; do
+              echo "===== $f"; tail -40 "$f"
+            done
+            echo "::endgroup::"
+            exit 1
+          fi
+          ls "$VCPKG_ROOT/installed/$VCPKG_DEFAULT_TRIPLET/lib" | head -20
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd rd
+          python3 build.py --portable --flutter --skip-portable-pack
+          ls -la "flutter/build/windows/x64/runner/Release" | head -20
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $src = "rd/flutter/build/windows/x64/runner/Release"
+          if (-not (Test-Path "$src/rustdesk.exe")) { throw "未找到 rustdesk.exe" }
+          Get-ChildItem $src -Filter *.pdb -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
+          $out = "RustDesk-Slim-windows-x64.zip"
+          Compress-Archive -Path "$src/*" -DestinationPath $out -Force
+          Get-Item $out | Select-Object Name, @{n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustDesk-Slim-windows-x64
+          path: RustDesk-Slim-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
